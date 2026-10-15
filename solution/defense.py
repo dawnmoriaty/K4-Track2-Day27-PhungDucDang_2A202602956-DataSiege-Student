@@ -3,6 +3,7 @@ Your defense. Implement register(ctx) and a handler per event type.
 See ../README.md for the full interface + toolkit reference, and
 ../RULES.md before you start.
 """
+import math
 from api import Verdict
 
 
@@ -15,7 +16,7 @@ def register(ctx):
 
 
 def check_data_batch(payload, ctx):
-    """Checks pillar: volume, null rate, mean amount, staleness."""
+    """Checks pillar: volume, null rate, mean amount, staleness, composite distance."""
     batch_id = payload.get("batch_id")
     profile = ctx.tools.batch_profile(batch_id)
     if not profile or "error" in profile:
@@ -43,11 +44,26 @@ def check_data_batch(payload, ctx):
     if staleness_min > b.get("staleness_min_max", 8.418):
         return Verdict(alert=True, pillar="checks", reason=f"staleness anomaly: {staleness_min}")
 
+    # 5. Multi-signal Composite Distance (Euclidean norm on normalized metrics)
+    mu_rows = (b.get("row_count_min", 435.4732) + b.get("row_count_max", 561.2948)) / 2.0
+    sigma_rows = (b.get("row_count_max", 561.2948) - b.get("row_count_min", 435.4732)) / 6.0
+    mu_mean = (b.get("mean_amount_min", 72.7645) + b.get("mean_amount_max", 90.6053)) / 2.0
+    sigma_mean = (b.get("mean_amount_max", 90.6053) - b.get("mean_amount_min", 72.7645)) / 6.0
+
+    z_rows = (row_count - mu_rows) / sigma_rows
+    z_mean = (mean_amount - mu_mean) / sigma_mean
+    r_null = null_rate / b.get("null_rate_max", 0.0109)
+    r_stale = staleness_min / b.get("staleness_min_max", 8.418)
+
+    norm2 = math.sqrt(z_rows ** 2 + z_mean ** 2 + r_null ** 2 + r_stale ** 2)
+    if norm2 > 3.20:
+        return Verdict(alert=True, pillar="checks", reason=f"composite distance norm2 anomaly: {norm2:.3f}")
+
     return Verdict(alert=False, pillar="checks")
 
 
 def check_contract_checkpoint(payload, ctx):
-    """Contracts pillar: schema hash, column types, freshness delay."""
+    """Contracts pillar: schema hash, column types, freshness delay & declared SLA."""
     contract_id = payload.get("contract_id")
     checkpoint_batch_id = payload.get("checkpoint_batch_id")
     diff = ctx.tools.contract_diff(contract_id, checkpoint_batch_id)
@@ -60,9 +76,10 @@ def check_contract_checkpoint(payload, ctx):
     if violations:
         return Verdict(alert=True, pillar="contracts", reason=f"contract violations: {violations}")
 
-    # 2. Freshness delay SLA
+    # 2. Freshness delay SLA (against declared SLA or baseline max)
     freshness_delay = diff.get("freshness_delay_min", 0.0)
-    if freshness_delay > b.get("freshness_delay_max_min", 11.1141):
+    declared_sla = payload.get("declared_sla", {}).get("freshness_min", 15.0)
+    if freshness_delay > declared_sla or freshness_delay > b.get("freshness_delay_max_min", 11.1141):
         return Verdict(alert=True, pillar="contracts", reason=f"freshness SLA breached: {freshness_delay}")
 
     return Verdict(alert=False, pillar="contracts")
@@ -84,7 +101,7 @@ def check_lineage_run(payload, ctx):
     if duration_ms > b.get("lineage_duration_ms_max", 5134.9804):
         return Verdict(alert=True, pillar="lineage", reason=f"runtime anomaly: {duration_ms}ms")
 
-    # 2. Missing upstream edge
+    # 2. Missing upstream edge (dbt model stg_orders requires both raw.orders and raw.customers)
     if len(actual_upstream) < 2 or "raw.customers" not in actual_upstream or "raw.orders" not in actual_upstream:
         return Verdict(alert=True, pillar="lineage", reason=f"missing upstream: {actual_upstream}")
 
@@ -103,9 +120,9 @@ def check_feature_materialization(payload, ctx):
     if not drift or "error" in drift:
         return Verdict(alert=False, pillar="ai_infra")
 
-    # Use a robust sigma threshold (0.75) between clean max (0.47) and subtle fault min (0.97)
+    # Robust calibrated sigma threshold (0.65) separating clean noise (<0.48) from real skew (>0.97)
     mean_shift_sigma = drift.get("mean_shift_sigma", 0.0)
-    if mean_shift_sigma > 0.75:
+    if mean_shift_sigma > 0.65:
         return Verdict(alert=True, pillar="ai_infra", reason=f"feature shift sigma: {mean_shift_sigma}")
 
     return Verdict(alert=False, pillar="ai_infra")
@@ -132,4 +149,5 @@ def check_embedding_batch(payload, ctx):
         return Verdict(alert=True, pillar="ai_infra", reason=f"corpus staleness: {avg_doc_age_days}")
 
     return Verdict(alert=False, pillar="ai_infra")
+
 
